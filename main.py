@@ -15,7 +15,7 @@ from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.client.telegram import TelegramAPIServer
 from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandStart
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 
 def load_env() -> None:
@@ -51,6 +51,7 @@ STORAGE_RELEASE_URL = f"{STORAGE_REPO_URL}/releases/tag/{RELEASE_TAG}"
 
 router = Router()
 pending_uploads: dict[tuple[int, int], dict[str, object]] = {}
+ASSETS_PAGE_SIZE = 8
 
 
 def format_size(size: int | None) -> str:
@@ -83,6 +84,18 @@ def to_custom_asset_name(value: str, fallback: str | None = None) -> str:
 def message_key(message: Message) -> tuple[int, int]:
     user_id = message.from_user.id if message.from_user else 0
     return (message.chat.id, user_id)
+
+
+def callback_key(query: CallbackQuery) -> tuple[int, int] | None:
+    if query.message is None:
+        return None
+    return (query.message.chat.id, query.from_user.id)
+
+
+def short_name(value: str, limit: int = 36) -> str:
+    if len(value) <= limit:
+        return value
+    return value[: limit - 1] + "…"
 
 
 def redact(value: str) -> str:
@@ -200,6 +213,42 @@ def storage_markup() -> InlineKeyboardMarkup:
     )
 
 
+def mode_markup() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Новый файл", callback_data="upload_mode:new")],
+            [InlineKeyboardButton(text="Обновление существующего", callback_data="upload_mode:update")],
+            [InlineKeyboardButton(text="Отмена", callback_data="upload_cancel")],
+        ]
+    )
+
+
+def assets_markup(assets: list[str], page: int) -> InlineKeyboardMarkup:
+    total_pages = max(1, (len(assets) + ASSETS_PAGE_SIZE - 1) // ASSETS_PAGE_SIZE)
+    safe_page = max(0, min(page, total_pages - 1))
+    start = safe_page * ASSETS_PAGE_SIZE
+    end = min(start + ASSETS_PAGE_SIZE, len(assets))
+    rows: list[list[InlineKeyboardButton]] = []
+    for index in range(start, end):
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=short_name(assets[index]),
+                    callback_data=f"upload_pick:{index}",
+                )
+            ]
+        )
+    navigation: list[InlineKeyboardButton] = []
+    if safe_page > 0:
+        navigation.append(InlineKeyboardButton(text="⬅", callback_data=f"upload_page:{safe_page - 1}"))
+    if safe_page < total_pages - 1:
+        navigation.append(InlineKeyboardButton(text="➡", callback_data=f"upload_page:{safe_page + 1}"))
+    if navigation:
+        rows.append(navigation)
+    rows.append([InlineKeyboardButton(text="Отмена", callback_data="upload_cancel")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 def success_markup(link: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -211,7 +260,7 @@ def success_markup(link: str) -> InlineKeyboardMarkup:
 
 START_TEXT = (
     "<b>APK Mirror Bot</b>\n"
-    "Отправь APK как <b>документ</b>, затем задай имя файла, и я загружу его в GitHub Releases.\n\n"
+    "Отправь APK как <b>документ</b>, выбери режим и я загружу файл в GitHub Releases.\n\n"
     "Команды:\n"
     "<code>/start</code> - приветствие\n"
     "<code>/help</code> - краткая инструкция\n"
@@ -222,9 +271,10 @@ START_TEXT = (
 HELP_TEXT = (
     "Как это работает:\n"
     "1) Отправляешь APK как документ\n"
-    "2) Отправляешь желаемое имя файла\n"
-    "3) Бот скачивает файл и загружает в GitHub Releases\n"
-    "4) Получаешь прямую ссылку на скачивание"
+    "2) Выбираешь режим: новый файл или обновление существующего\n"
+    "3) Для нового файла задаешь имя, для обновления выбираешь файл из списка\n"
+    "4) Бот скачивает APK и загружает в GitHub Releases\n"
+    "5) Получаешь прямую ссылку на скачивание"
 )
 
 
@@ -262,6 +312,37 @@ async def ensure_release() -> None:
         raise RuntimeError(output)
 
 
+async def release_apk_assets() -> list[str]:
+    await ensure_release()
+    code, output = await run_command(
+        "gh",
+        "release",
+        "view",
+        RELEASE_TAG,
+        "--repo",
+        f"{GITHUB_OWNER}/{STORAGE_REPO}",
+        "--json",
+        "assets",
+    )
+    if code != 0:
+        raise RuntimeError(output)
+    try:
+        payload = json.loads(output)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Invalid release payload: {exc}") from exc
+    assets = payload.get("assets") if isinstance(payload, dict) else None
+    if not isinstance(assets, list):
+        return []
+    result: list[str] = []
+    for item in assets:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("name")
+        if isinstance(name, str) and name.lower().endswith(".apk"):
+            result.append(name)
+    return sorted(set(result), key=str.casefold)
+
+
 async def upload_to_release(local_path: Path) -> str:
     await ensure_release()
     code, output = await run_command(
@@ -285,13 +366,16 @@ async def process_upload(
     source_name: str,
     file_size: int | None,
     asset_name: str,
+    mode: str,
 ) -> None:
     TMP_DIR.mkdir(parents=True, exist_ok=True)
     job_dir = TMP_DIR / uuid.uuid4().hex
     job_dir.mkdir(parents=True, exist_ok=True)
     local_path = job_dir / asset_name
+    mode_label = "обновление" if mode == "update" else "новый файл"
     progress = await message.answer(
         f"Принял: <b>{html.escape(source_name)}</b> ({format_size(file_size)}).\n"
+        f"Режим: <b>{mode_label}</b>.\n"
         f"Имя публикации: <code>{html.escape(asset_name)}</code>.\n"
         "1/3 Скачиваю файл..."
     )
@@ -302,6 +386,7 @@ async def process_upload(
         await download_with_fallback(message.bot, file_id, telegram_file.file_path, local_path)
         await progress.edit_text(
             f"Принял: <b>{html.escape(source_name)}</b> ({format_size(file_size)}).\n"
+            f"Режим: <b>{mode_label}</b>.\n"
             f"Имя публикации: <code>{html.escape(asset_name)}</code>.\n"
             "2/3 Загружаю в GitHub Releases..."
         )
@@ -339,18 +424,166 @@ async def cancel_handler(message: Message) -> None:
     await message.answer("Текущая загрузка отменена.")
 
 
+@router.callback_query(F.data == "upload_cancel")
+async def cancel_callback_handler(query: CallbackQuery) -> None:
+    key = callback_key(query)
+    if key is None:
+        await query.answer("Не удалось определить сессию", show_alert=True)
+        return
+    if pending_uploads.pop(key, None) is None:
+        await query.answer("Сессия уже завершена", show_alert=False)
+        return
+    await query.answer("Загрузка отменена", show_alert=False)
+    if query.message is not None:
+        await query.message.edit_text("Текущая загрузка отменена.")
+
+
 @router.message(Command("skip"))
 async def skip_name_handler(message: Message) -> None:
     key = message_key(message)
-    item = pending_uploads.pop(key, None)
+    item = pending_uploads.get(key)
     if item is None:
         await message.answer("Сначала отправь APK как документ.")
         return
+    if str(item.get("step")) != "enter_name":
+        await message.answer("Сейчас пропуск имени недоступен.")
+        return
+    pending_uploads.pop(key, None)
     source_name = str(item["file_name"])
     file_id = str(item["file_id"])
     file_size = int(item["file_size"]) if isinstance(item.get("file_size"), int) else None
     asset_name = to_custom_asset_name(source_name, source_name)
-    await process_upload(message, file_id, source_name, file_size, asset_name)
+    await process_upload(message, file_id, source_name, file_size, asset_name, mode="new")
+
+
+@router.callback_query(F.data.startswith("upload_mode:"))
+async def mode_callback_handler(query: CallbackQuery) -> None:
+    key = callback_key(query)
+    if key is None:
+        await query.answer("Не удалось определить сессию", show_alert=True)
+        return
+    item = pending_uploads.get(key)
+    if item is None:
+        await query.answer("Сначала отправь APK", show_alert=True)
+        return
+    if query.message is None:
+        await query.answer("Сообщение недоступно", show_alert=True)
+        return
+    mode = (query.data or "").split(":", 1)[1]
+    if mode == "new":
+        item["mode"] = "new"
+        item["step"] = "enter_name"
+        item.pop("assets", None)
+        item.pop("page", None)
+        await query.message.edit_text(
+            "Режим: <b>новый файл</b>.\n"
+            "Отправь название для публикации.\n"
+            "Пример: <code>After Motion Z+</code>\n"
+            "Или используй <code>/skip</code>, чтобы оставить исходное имя."
+        )
+        await query.answer()
+        return
+    if mode != "update":
+        await query.answer("Неизвестный режим", show_alert=True)
+        return
+    try:
+        assets = await release_apk_assets()
+    except Exception as exc:
+        await query.message.edit_text(f"Не удалось получить список файлов:\n<code>{html.escape(redact(str(exc)))}</code>")
+        await query.answer()
+        return
+    if not assets:
+        item["mode"] = "new"
+        item["step"] = "enter_name"
+        item.pop("assets", None)
+        item.pop("page", None)
+        await query.message.edit_text(
+            "В релизе пока нет APK для обновления.\n"
+            "Переключил в режим <b>новый файл</b>.\n"
+            "Отправь название для публикации или используй <code>/skip</code>."
+        )
+        await query.answer()
+        return
+    item["mode"] = "update"
+    item["step"] = "choose_existing"
+    item["assets"] = assets
+    item["page"] = 0
+    await query.message.edit_text(
+        "Режим: <b>обновление существующего</b>.\nВыбери APK для замены:",
+        reply_markup=assets_markup(assets, 0),
+    )
+    await query.answer()
+
+
+@router.callback_query(F.data.startswith("upload_page:"))
+async def assets_page_callback_handler(query: CallbackQuery) -> None:
+    key = callback_key(query)
+    if key is None:
+        await query.answer("Не удалось определить сессию", show_alert=True)
+        return
+    item = pending_uploads.get(key)
+    if item is None or str(item.get("step")) != "choose_existing":
+        await query.answer("Сессия неактивна", show_alert=True)
+        return
+    if query.message is None:
+        await query.answer("Сообщение недоступно", show_alert=True)
+        return
+    assets = item.get("assets")
+    if not isinstance(assets, list):
+        await query.answer("Список файлов не найден", show_alert=True)
+        return
+    raw_page = (query.data or "").split(":", 1)[1]
+    try:
+        page = int(raw_page)
+    except ValueError:
+        await query.answer()
+        return
+    total_pages = max(1, (len(assets) + ASSETS_PAGE_SIZE - 1) // ASSETS_PAGE_SIZE)
+    safe_page = max(0, min(page, total_pages - 1))
+    item["page"] = safe_page
+    await query.message.edit_text(
+        "Режим: <b>обновление существующего</b>.\nВыбери APK для замены:",
+        reply_markup=assets_markup(assets, safe_page),
+    )
+    await query.answer()
+
+
+@router.callback_query(F.data.startswith("upload_pick:"))
+async def asset_pick_callback_handler(query: CallbackQuery) -> None:
+    key = callback_key(query)
+    if key is None:
+        await query.answer("Не удалось определить сессию", show_alert=True)
+        return
+    item = pending_uploads.get(key)
+    if item is None or str(item.get("step")) != "choose_existing":
+        await query.answer("Сессия неактивна", show_alert=True)
+        return
+    if query.message is None:
+        await query.answer("Сообщение недоступно", show_alert=True)
+        return
+    assets = item.get("assets")
+    if not isinstance(assets, list):
+        await query.answer("Список файлов не найден", show_alert=True)
+        return
+    raw_index = (query.data or "").split(":", 1)[1]
+    try:
+        index = int(raw_index)
+    except ValueError:
+        await query.answer("Некорректный выбор", show_alert=True)
+        return
+    if index < 0 or index >= len(assets):
+        await query.answer("Файл не найден", show_alert=True)
+        return
+    pending_uploads.pop(key, None)
+    source_name = str(item["file_name"])
+    file_id = str(item["file_id"])
+    file_size = int(item["file_size"]) if isinstance(item.get("file_size"), int) else None
+    asset_name = str(assets[index])
+    await query.answer("Запускаю обновление", show_alert=False)
+    await query.message.edit_text(
+        f"Выбран файл для обновления: <code>{html.escape(asset_name)}</code>.\nНачинаю загрузку..."
+    )
+    await process_upload(query.message, file_id, source_name, file_size, asset_name, mode="update")
 
 
 @router.message(F.document)
@@ -374,12 +607,13 @@ async def apk_handler(message: Message) -> None:
         "file_id": document.file_id,
         "file_name": file_name,
         "file_size": document.file_size,
+        "step": "choose_mode",
+        "mode": None,
     }
     await message.answer(
         f"Файл принят: <b>{html.escape(file_name)}</b> ({format_size(document.file_size)}).\n"
-        "Теперь отправь название для публикации.\n"
-        "Пример: <code>After Motion Z+</code>\n"
-        "Или используй <code>/skip</code>, чтобы оставить исходное имя."
+        "Выбери режим загрузки:",
+        reply_markup=mode_markup(),
     )
 
 
@@ -390,6 +624,15 @@ async def name_handler(message: Message) -> None:
     if item is None:
         await message.answer("Отправь APK как документ. Для подсказки: /help")
         return
+    if str(item.get("step")) == "choose_mode":
+        await message.answer("Сначала выбери режим кнопками: новый файл или обновление.")
+        return
+    if str(item.get("step")) == "choose_existing":
+        await message.answer("Выбери существующий файл кнопкой из списка или нажми /cancel.")
+        return
+    if str(item.get("step")) != "enter_name":
+        await message.answer("Сессия в неизвестном состоянии. Отправь /cancel и начни заново.")
+        return
     name_text = (message.text or "").strip()
     if not name_text:
         await message.answer("Название пустое. Отправь текст с именем файла.")
@@ -399,7 +642,7 @@ async def name_handler(message: Message) -> None:
     file_id = str(item["file_id"])
     file_size = int(item["file_size"]) if isinstance(item.get("file_size"), int) else None
     asset_name = to_custom_asset_name(name_text, source_name)
-    await process_upload(message, file_id, source_name, file_size, asset_name)
+    await process_upload(message, file_id, source_name, file_size, asset_name, mode="new")
 
 
 @router.message()

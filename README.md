@@ -23,14 +23,22 @@ This project receives `.apk` documents in Telegram, downloads each file, uploads
 ## Runtime Flow
 
 1. User sends an `.apk` file to the bot.
-2. Bot asks for a custom release filename.
-3. User sends the desired name (or uses `/skip` to keep source name).
-4. Bot shows progress states (`1/3`, `2/3`, `3/3`) and validates file type/size.
-5. Bot downloads the file to a local temporary directory with fallback strategies (local filesystem, Docker `telegram_bot_api` container copy, local file endpoint, cloud API).
-6. Bot ensures the target GitHub Release tag exists.
-7. Bot uploads the file as a release asset with `gh release upload --clobber`.
-8. Bot returns a direct asset URL and inline download/storage buttons.
-9. Bot deletes the local file.
+2. Bot asks for mode: new file or update existing file.
+3. For new file mode, user sends a custom name (or uses `/skip` to keep source name).
+4. For update mode, bot shows existing APK assets and user picks one for replacement.
+5. Bot shows progress states (`1/3`, `2/3`, `3/3`) and validates file type/size.
+6. Bot downloads the file to a local temporary directory with fallback strategies (local filesystem, Docker `telegram_bot_api` container copy, local file endpoint, cloud API).
+7. Bot ensures the target GitHub Release tag exists.
+8. Bot uploads the file as a release asset with `gh release upload --clobber`.
+9. Bot returns a direct asset URL and inline download/storage buttons.
+10. Bot deletes the local file.
+
+## Commands
+
+- `/start` — show quick intro.
+- `/help` — show upload flow.
+- `/skip` — keep source filename in new file mode.
+- `/cancel` — cancel current upload session.
 
 ## Requirements
 

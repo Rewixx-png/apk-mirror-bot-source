@@ -3,3 +3,10 @@ __pycache__/
 .env
 .tmp_apk/
 *.apk.tmp
+*.mp4
+*.zip
+*.pth
+*.tar.gz
+*.rar
+*.db
+*.pth.tar

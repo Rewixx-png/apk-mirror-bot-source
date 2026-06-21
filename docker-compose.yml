@@ -1,0 +1,8 @@
+services:
+  apk-mirror-bot:
+    build: .
+    container_name: apk_mirror_bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    network_mode: host
